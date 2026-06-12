@@ -8,15 +8,56 @@ from __future__ import annotations
 
 from typing import Literal
 
+import numpy as np
 import pandas as pd
+
+from core.data import load_data_with_required_preprocess, compute_num_days
+from core.features.book import compute_book_features
+from core.features.flow import compute_flow_features
+from core.features.liq import compute_liq_features
+from core.features.time import compute_time_features
+from core.features.vol import compute_vol_features
+from core.model import train_model, predict
+from core.targets.markout import add_mid, compute_markout
+from core.targets.pnl import compute_pnl
+from core.transforms.direction import direction_relativize
+from core.transforms.normalize import fill_nan_inf
 
 from strategies.liq_filter.config import (
     TAUS, SYMBOLS, TURNOVER_FLOOR_PER_DAY, FeatureConfig, FittedPipeline,
 )
-from strategies.liq_filter.scoring import ScoreReport
+from strategies.liq_filter.scoring import ScoreReport, score_all, reports_to_frame
+from strategies.liq_filter.strategy import strategy_raw_score
+from strategies.liq_filter.threshold import fit_threshold, apply_filter
 
 
 Symbol = Literal["btcusdt", "ethusdt"]
+
+
+def _side_to_s(trades: pd.DataFrame) -> np.ndarray:
+    side = trades["side"].astype(str).str.lower()
+    return np.where(side.eq("buy"), 1, -1).astype("int8")
+
+
+def _build_features(
+    trades: pd.DataFrame,
+    bbo: pd.DataFrame,
+    liq_binance: pd.DataFrame,
+    liq_bybit: pd.DataFrame,
+    cfg: FeatureConfig,
+) -> pd.DataFrame:
+    parts = [
+        compute_liq_features(trades, liq_binance, liq_bybit, cfg.liq_halflives_s),
+        compute_book_features(trades, bbo, cfg.book_windows_s),
+        compute_flow_features(trades, cfg.flow_windows_s),
+        compute_time_features(trades),
+        compute_vol_features(trades, bbo),
+    ]
+
+    X = pd.concat(parts, axis=1)
+    X = direction_relativize(X, _side_to_s(trades))
+    X = fill_nan_inf(X)
+    return X
 
 
 def run_train(
@@ -31,15 +72,57 @@ def run_train(
     """
     Train on the train split for the given symbols. Produces a FittedPipeline.
 
-    For each symbol:
-      1. load_data_with_required_preprocess(data_dir, symbol, split='train')
-      2. add_mid → compute_markout → compute_pnl
-      3. make_features via DatasetBuilder
-      4. For each tau: train_model or store strategy params
-
     Threshold is NOT fitted here — calibrated at inference time via fit_threshold.
     """
-    raise NotImplementedError
+    cfg = feature_config or FeatureConfig()
+
+    fitted = FittedPipeline(
+        feature_config=cfg,
+        models={},
+        use_ml=use_ml,
+        target_turnover_per_day=float(target_turnover_per_day),
+    )
+
+    if not use_ml:
+        for symbol in symbols:
+            for tau in TAUS:
+                fitted.models[(symbol, int(tau))] = None
+        return fitted
+
+    for symbol in symbols:
+        if verbose:
+            print(f"[train] loading {symbol}", flush=True)
+
+        trades, bbo, liq_binance, liq_bybit = load_data_with_required_preprocess(
+            data_dir=data_dir,
+            symbol=symbol,  # type: ignore[arg-type]
+            split="train",
+        )
+
+        bbo = add_mid(bbo)
+        trades = compute_markout(trades, bbo, TAUS)
+        trades = compute_pnl(trades, TAUS)
+
+        X = _build_features(trades, bbo, liq_binance, liq_bybit, cfg)
+        w = trades.loc[X.index, "w"]
+
+        for tau in TAUS:
+            y = trades.loc[X.index, f"pnl_{tau}"]
+            ok = y.notna() & w.notna()
+
+            if verbose:
+                print(f"[train] {symbol} tau={tau} rows={int(ok.sum()):,}", flush=True)
+
+            model = train_model(
+                features=X.loc[ok],
+                target=y.loc[ok],
+                sample_weight=w.loc[ok],
+                model_params=model_params,
+            )
+
+            fitted.models[(symbol, int(tau))] = model
+
+    return fitted
 
 
 def run_eval(
@@ -55,7 +138,67 @@ def run_eval(
     Returns {symbol: {tau: ScoreReport}}.
     ONE-SHOT evaluation — do NOT iterate on the threshold to improve val Score.
     """
-    raise NotImplementedError
+    result: dict[str, dict[int, ScoreReport]] = {}
+
+    for symbol in symbols:
+        if verbose:
+            print(f"[eval] loading {symbol} split={split}", flush=True)
+
+        trades, bbo, liq_binance, liq_bybit = load_data_with_required_preprocess(
+            data_dir=data_dir,
+            symbol=symbol,  # type: ignore[arg-type]
+            split=split,
+        )
+
+        num_days = compute_num_days(trades)
+
+        bbo = add_mid(bbo)
+        trades = compute_markout(trades, bbo, TAUS)
+        trades = compute_pnl(trades, TAUS)
+
+        X = _build_features(trades, bbo, liq_binance, liq_bybit, fitted.feature_config)
+        scored = trades.loc[X.index].copy()
+        w = scored["w"].to_numpy(dtype="float64")
+
+        f_by_tau: dict[int, np.ndarray] = {}
+
+        for tau in TAUS:
+            model = fitted.models.get((symbol, int(tau)))
+
+            if fitted.use_ml:
+                if model is None:
+                    raise ValueError(f"No fitted model for {(symbol, tau)}")
+                raw_score = predict(model, X)
+            else:
+                raw_score = strategy_raw_score(X, scored)
+
+            threshold = fit_threshold(
+                raw_score=raw_score,
+                w=w,
+                num_days=num_days,
+                target_turnover_per_day=fitted.target_turnover_per_day,
+            )
+
+            edge_mask = scored[f"edge_{tau}"].to_numpy(dtype=bool)
+
+            f_by_tau[int(tau)] = apply_filter(
+                raw_score=raw_score,
+                threshold=threshold,
+                edge_mask=edge_mask,
+            )
+
+            if verbose:
+                kept = int((f_by_tau[int(tau)] == 0).sum())
+                filt = int((f_by_tau[int(tau)] == 1).sum())
+                print(
+                    f"[eval] {symbol} tau={tau} threshold={threshold:.6g} "
+                    f"kept={kept:,} filtered={filt:,}",
+                    flush=True,
+                )
+
+        result[symbol] = score_all(scored, f_by_tau, num_days)
+
+    return result
 
 
 def run_experiment(
@@ -71,4 +214,32 @@ def run_experiment(
     Full experiment: train on train split, evaluate on both train and validation.
     Returns (fitted_pipeline, raw_reports_dict, summary_dataframe).
     """
-    raise NotImplementedError
+    fitted = run_train(
+        data_dir=data_dir,
+        use_ml=use_ml,
+        symbols=symbols,
+        model_params=model_params,
+        target_turnover_per_day=target_turnover_per_day,
+        verbose=verbose,
+    )
+
+    reports = {
+        "train": run_eval(data_dir, "train", fitted, symbols=symbols, verbose=verbose),
+        "validation": run_eval(data_dir, "validation", fitted, symbols=symbols, verbose=verbose),
+    }
+
+    frames: list[pd.DataFrame] = []
+
+    for split, by_symbol in reports.items():
+        for symbol, rep in by_symbol.items():
+            df = reports_to_frame(
+                rep,
+                symbol=symbol,
+                experiment=f"{name}_{split}",
+            )
+            df.insert(0, "split", split)
+            frames.append(df)
+
+    summary = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    return fitted, reports, summary
