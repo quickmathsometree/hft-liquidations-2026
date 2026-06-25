@@ -12,16 +12,18 @@ import numpy as np
 import pandas as pd
 
 from core.data import load_data_with_required_preprocess, compute_num_days
-from core.features.book import compute_book_features
-from core.features.flow import compute_flow_features
-from core.features.liq import compute_liq_features
-from core.features.time import compute_time_features
-from core.features.vol import compute_vol_features
+from core.dataset import DatasetBuilder
+from core.features.book import BookFeatures
+from core.features.flow import FlowFeatures
+from core.features.liq import LiqFeatures
+from core.features.time import TimeFeatures
+from core.features.vol import VolFeatures
 from core.model import train_model, predict
+from core.sampling.samplers import EveryTrade
 from core.targets.markout import add_mid, compute_markout
 from core.targets.pnl import compute_pnl
-from core.transforms.direction import direction_relativize
-from core.transforms.normalize import fill_nan_inf
+from core.transforms.direction import DirectionRelativize
+from core.transforms.normalize import FillNanInf
 
 from strategies.liq_filter.config import (
     TAUS, SYMBOLS, TURNOVER_FLOOR_PER_DAY, FeatureConfig, FittedPipeline,
@@ -34,11 +36,6 @@ from strategies.liq_filter.threshold import fit_threshold, apply_filter
 Symbol = Literal["btcusdt", "ethusdt"]
 
 
-def _side_to_s(trades: pd.DataFrame) -> np.ndarray:
-    side = trades["side"].astype(str).str.lower()
-    return np.where(side.eq("buy"), 1, -1).astype("int8")
-
-
 def _build_features(
     trades: pd.DataFrame,
     bbo: pd.DataFrame,
@@ -46,17 +43,38 @@ def _build_features(
     liq_bybit: pd.DataFrame,
     cfg: FeatureConfig,
 ) -> pd.DataFrame:
-    parts = [
-        compute_liq_features(trades, liq_binance, liq_bybit, cfg.liq_halflives_s),
-        compute_book_features(trades, bbo, cfg.book_windows_s),
-        compute_flow_features(trades, cfg.flow_windows_s),
-        compute_time_features(trades),
-        compute_vol_features(trades, bbo),
-    ]
+    builder = DatasetBuilder(
+        features=[
+            LiqFeatures("binance", "buy", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("binance", "sell", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("bybit", "buy", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("bybit", "sell", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            BookFeatures(depth_delta_windows_s=cfg.book_windows_s),
+            FlowFeatures(windows_s=cfg.flow_windows_s),
+            TimeFeatures(),
+            VolFeatures(windows_s=cfg.vol_windows_s, rank_window=cfg.vol_rank_window),
+        ],
+        transforms=[
+            DirectionRelativize(),
+            FillNanInf(),
+        ],
+        sampler=EveryTrade(),
+    )
 
-    X = pd.concat(parts, axis=1)
-    X = direction_relativize(X, _side_to_s(trades))
-    X = fill_nan_inf(X)
+    X = builder.build(
+        trades=trades,
+        bbo=bbo,
+        liq_binance=liq_binance,
+        liq_bybit=liq_bybit,
+    )
+
+    if not cfg.use_opp_side_liq:
+        drop_cols = [
+            c for c in X.columns
+            if str(c).startswith("liq_") and "_opp_" in str(c)
+        ]
+        X = X.drop(columns=drop_cols)
+
     return X
 
 

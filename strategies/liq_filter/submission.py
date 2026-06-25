@@ -11,29 +11,25 @@ import numpy as np
 import pandas as pd
 
 from core.data import BYBIT_LAG_US, US_PER_SECOND, _prepare_frame, compute_num_days, detect_symbol
-from core.features.book import compute_book_features
-from core.features.flow import compute_flow_features
-from core.features.liq import compute_liq_features
-from core.features.time import compute_time_features
-from core.features.vol import compute_vol_features
+from core.dataset import DatasetBuilder
+from core.features.book import BookFeatures
+from core.features.flow import FlowFeatures
+from core.features.liq import LiqFeatures
+from core.features.time import TimeFeatures
+from core.features.vol import VolFeatures
 from core.model import predict
+from core.sampling.samplers import EveryTrade
 from core.targets.markout import add_mid
 from core.targets.pnl import NOTIONAL_CLIP
-from core.transforms.direction import direction_relativize
-from core.transforms.normalize import fill_nan_inf
+from core.transforms.direction import DirectionRelativize
+from core.transforms.normalize import FillNanInf
 
 from strategies.liq_filter.config import TAUS, FittedPipeline
 from strategies.liq_filter.strategy import strategy_raw_score
 from strategies.liq_filter.threshold import fit_threshold, apply_filter
 
 
-# Populated by run_train() before submission. Baked into module scope.
 FITTED: FittedPipeline | None = None
-
-
-def _side_to_s(trades: pd.DataFrame) -> np.ndarray:
-    side = trades["side"].astype(str).str.lower()
-    return np.where(side.eq("buy"), 1, -1).astype("int8")
 
 
 def _build_features(
@@ -45,19 +41,38 @@ def _build_features(
 ) -> pd.DataFrame:
     cfg = fitted.feature_config
 
-    X = pd.concat(
-        [
-            compute_liq_features(trades, liq_binance, liq_bybit, cfg.liq_halflives_s),
-            compute_book_features(trades, bbo, cfg.book_windows_s),
-            compute_flow_features(trades, cfg.flow_windows_s),
-            compute_time_features(trades),
-            compute_vol_features(trades, bbo),
+    builder = DatasetBuilder(
+        features=[
+            LiqFeatures("binance", "buy", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("binance", "sell", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("bybit", "buy", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            LiqFeatures("bybit", "sell", halflives_s=cfg.liq_halflives_s, count_windows_s=cfg.flow_windows_s),
+            BookFeatures(depth_delta_windows_s=cfg.book_windows_s),
+            FlowFeatures(windows_s=cfg.flow_windows_s),
+            TimeFeatures(),
+            VolFeatures(windows_s=cfg.vol_windows_s, rank_window=cfg.vol_rank_window),
         ],
-        axis=1,
+        transforms=[
+            DirectionRelativize(),
+            FillNanInf(),
+        ],
+        sampler=EveryTrade(),
     )
 
-    X = direction_relativize(X, _side_to_s(trades))
-    X = fill_nan_inf(X)
+    X = builder.build(
+        trades=trades,
+        bbo=bbo,
+        liq_binance=liq_binance,
+        liq_bybit=liq_bybit,
+    )
+
+    if not cfg.use_opp_side_liq:
+        drop_cols = [
+            c for c in X.columns
+            if str(c).startswith("liq_") and "_opp_" in str(c)
+        ]
+        X = X.drop(columns=drop_cols)
+
     return X
 
 
@@ -71,7 +86,7 @@ def make_filter(
     FINAL submission function.
 
     Accepts 4 frames (same schemas as public files; liq_bybit arrives UNSHIFTED).
-    Returns { 30: arr_30, 120: arr_120, 300: arr_300 },
+    Returns {30: arr_30, 120: arr_120, 300: arr_300},
     each arr is np.ndarray of length len(trades) with values 0 or 1.
     """
     if FITTED is None:
@@ -86,6 +101,7 @@ def make_filter(
 
     liq_bybit = liq_bybit.copy()
     liq_bybit["timestamp"] = liq_bybit["timestamp"].astype("int64") + BYBIT_LAG_US
+    liq_bybit = liq_bybit.sort_values("timestamp").reset_index(drop=True)
 
     bbo = add_mid(bbo)
 
@@ -100,10 +116,10 @@ def make_filter(
 
     num_days = compute_num_days(scored)
 
-    out: dict[int, np.ndarray] = {}
-
     max_bbo_ts = int(bbo["timestamp"].max()) if len(bbo) else -1
     trade_ts = scored["timestamp"].to_numpy(dtype="int64")
+
+    out: dict[int, np.ndarray] = {}
 
     for tau in TAUS:
         key = (symbol, int(tau))

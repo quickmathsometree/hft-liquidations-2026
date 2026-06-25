@@ -20,6 +20,8 @@ class FeatureConfig:
     liq_halflives_s: tuple[float, ...] = (1.0, 5.0, 30.0)
     flow_windows_s: tuple[float, ...] = (1.0, 5.0, 30.0)
     book_windows_s: tuple[float, ...] = (1.0, 10.0)
+    vol_windows_s: tuple[float, ...] = (60.0, 300.0)
+    vol_rank_window: int = 1000
     use_opp_side_liq: bool = True
 
 
