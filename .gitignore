@@ -35,3 +35,6 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Task-4 generated outputs
+artifacts4/
