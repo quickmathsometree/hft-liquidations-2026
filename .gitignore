@@ -1,44 +1,40 @@
-# Environment
-.env
-*.env
-!.env.template
+# Raw market data (downloaded separately; multi-GB, never committed)
+data/
+*.bin
+*.bin*.part
+*.tar
+*.tar.gz
+
+# Generated outputs (regenerate with: python lib/factory.py --symbols btcusdt && ... --merge)
+artifacts/
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
+*.egg-info/
+.eggs/
+build/
+dist/
 .venv/
 venv/
-ENV/
 env/
-*.egg-info/
-dist/
-build/
-
-# IDEs
-.vscode/
-.idea/
-.DS_Store
-.claude/
-
-# Data & Cache
-*.csv
-*.parquet
-*.tar
-*.xlsx
-*.pkl
-*.log
-cache_dir/*
-.gitkeep
-artifacts/
+.python-version
 
 # Jupyter
 .ipynb_checkpoints/
+*-checkpoint.ipynb
+profile_default/
+ipython_config.py
 
-# Testing
-.pytest_cache/
-.mypy_cache/
-.coverage
-htmlcov/
+# OS / editor
+.DS_Store
+.DS_Store?
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Task-4 generated outputs
+artifacts4/
