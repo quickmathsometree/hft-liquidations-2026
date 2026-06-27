@@ -28,7 +28,32 @@ def fit_threshold(
 
     Label-free: requires only w_i, not pnl. Valid on hidden test.
     """
-    raise NotImplementedError
+    score = np.asarray(raw_score, dtype="float64")
+    weight = np.asarray(w, dtype="float64")
+
+    ok = np.isfinite(score) & np.isfinite(weight) & (weight > 0)
+
+    if not np.any(ok):
+        return -np.inf
+
+    days = max(float(num_days), 1e-12)
+    need = float(target_turnover_per_day) * days
+
+    total = float(weight[ok].sum())
+    if total < need:
+        return -np.inf
+
+    score_ok = score[ok]
+    weight_ok = weight[ok]
+
+    order = np.argsort(-score_ok, kind="mergesort")
+    score_sorted = score_ok[order]
+    weight_sorted = weight_ok[order]
+
+    csum = np.cumsum(weight_sorted)
+    k = int(np.searchsorted(csum, need, side="left"))
+
+    return float(score_sorted[min(k, len(score_sorted) - 1)])
 
 
 def apply_filter(
@@ -41,4 +66,15 @@ def apply_filter(
     Edge trades (edge_mask=True) forced to f_i = 0 (free turnover, out of score).
     Returns int array of 0/1.
     """
-    raise NotImplementedError
+    score = np.asarray(raw_score, dtype="float64")
+
+    f = (score < float(threshold)).astype(np.int8)
+
+    bad = ~np.isfinite(score)
+    f[bad] = 0
+
+    if edge_mask is not None:
+        edge = np.asarray(edge_mask, dtype=bool)
+        f[edge] = 0
+
+    return f
