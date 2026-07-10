@@ -20,7 +20,13 @@ def add_mid(bbo: pd.DataFrame) -> pd.DataFrame:
         mid        = (bid_price + ask_price) / 2
         microprice = (bid_price * ask_amount + ask_price * bid_amount) / (bid_amount + ask_amount)
     """
-    raise NotImplementedError
+    bbo = bbo.copy()
+    bbo["mid"] = (bbo["bid_price"] + bbo["ask_price"]) / 2
+    total_size = bbo["bid_amount"] + bbo["ask_amount"]
+    bbo["microprice"] = (
+        bbo["bid_price"] * bbo["ask_amount"] + bbo["ask_price"] * bbo["bid_amount"]
+    ) / total_size
+    return bbo
 
 
 def compute_markout(
@@ -41,4 +47,19 @@ def compute_markout(
         mid_{tau}  : float64 (NaN on edge trades)
         edge_{tau} : bool (True = trade falls off BBO range, excluded from scoring)
     """
-    raise NotImplementedError
+    trades = trades.copy()
+    bbo_ts  = bbo["timestamp"].values
+    bbo_mid = bbo["mid"].values
+    bbo_max_ts = bbo_ts[-1]
+
+    for tau in taus:
+        lookup_ts = trades["timestamp"].values + tau * US_PER_SECOND
+        idx = np.searchsorted(bbo_ts, lookup_ts, side="right") - 1
+
+        edge = lookup_ts > bbo_max_ts
+        mid_vals = np.where((idx >= 0) & ~edge, bbo_mid[np.clip(idx, 0, len(bbo_mid) - 1)], np.nan)
+
+        trades[f"mid_{tau}"]  = mid_vals
+        trades[f"edge_{tau}"] = edge
+
+    return trades

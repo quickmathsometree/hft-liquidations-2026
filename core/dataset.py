@@ -1,21 +1,16 @@
 """
 DatasetBuilder — Orchestrates feature computation, transforms, sampling, and labeling.
-
-This is the central composition point. It wires together:
-    raw market data → feature blocks → transforms → sampling → labeling → dataset
-
-Each block is independently testable and reusable across strategies.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import pandas as pd
 
 from core.features.base import FeatureBlock
 from core.sampling.samplers import Sampler, EveryTrade
+from core.transforms.base import Transform
 
 
 @dataclass
@@ -25,23 +20,38 @@ class DatasetBuilder:
 
     Usage:
         builder = DatasetBuilder(
-            features=[LiqPressureFeatures(...), BookFeatures(...), FlowFeatures(...)],
-            transforms=[direction_relativize, fill_nan_inf],
+            features=[
+                LiqFeatures('binance', 'buy',  halflives_s=[1.0, 5.0, 30.0],
+                             count_windows_s=[5.0, 30.0]),
+                LiqFeatures('binance', 'sell', halflives_s=[1.0, 5.0, 30.0],
+                             count_windows_s=[5.0, 30.0]),
+                LiqFeatures('bybit',   'buy',  halflives_s=[5.0, 30.0]),
+                LiqFeatures('bybit',   'sell', halflives_s=[5.0, 30.0]),
+                BookFeatures(depth_delta_windows_s=[1.0, 10.0]),
+                FlowFeatures(windows_s=[1.0, 5.0, 30.0]),
+                VolFeatures(windows_s=[5.0, 60.0, 300.0]),
+                TimeFeatures(),
+            ],
+            transforms=[
+                DirectionRelativize(),
+                Winsorize(0.01),
+                FillNanInf(),
+            ],
             sampler=EveryTrade(),
         )
         dataset = builder.build(trades, bbo, liq_binance, liq_bybit)
     """
 
-    features: list[FeatureBlock] = field(default_factory=list)
-    transforms: list[Any] = field(default_factory=list)  # callable(df, **ctx) -> df
-    sampler: Sampler = field(default_factory=EveryTrade)
+    features:   list[FeatureBlock] = field(default_factory=list)
+    transforms: list[Transform]    = field(default_factory=list)
+    sampler:    Sampler            = field(default_factory=EveryTrade)
 
     def build(
         self,
-        trades: pd.DataFrame,
-        bbo: pd.DataFrame,
+        trades:      pd.DataFrame,
+        bbo:         pd.DataFrame,
         liq_binance: pd.DataFrame | None = None,
-        liq_bybit: pd.DataFrame | None = None,
+        liq_bybit:   pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """
         Build the feature matrix.
@@ -55,4 +65,15 @@ class DatasetBuilder:
         Target columns (markout, pnl) are NOT computed here — they are added
         by the strategy layer using core.targets.
         """
-        raise NotImplementedError
+        kwargs = dict(bbo=bbo, liq_binance=liq_binance, liq_bybit=liq_bybit)
+
+        feature_df = pd.concat(
+            [f.compute(trades, **kwargs) for f in self.features],
+            axis=1,
+        )
+
+        for t in self.transforms:
+            feature_df = t.apply(feature_df, trades)
+
+        mask = self.sampler.sample_mask(trades)
+        return feature_df.loc[mask]
