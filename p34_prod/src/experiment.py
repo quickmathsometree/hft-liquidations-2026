@@ -9,7 +9,13 @@ import numpy as np
 import polars as pl
 from tqdm.auto import tqdm
 
-from features import DERIVED_FEATURES, add_derived_features, extract_Xyw, validate_columns
+from features import (
+    DERIVED_FEATURES,
+    EXTENDED_DERIVED_FEATURES,
+    add_all_derived_features,
+    extract_Xyw,
+    validate_columns,
+)
 from meta import iter_split_datasets
 from models import ModelSpec, get_model
 from scoring import (
@@ -41,20 +47,21 @@ class WalkForwardConfig:
     n_threshold_grid: int = 200
     turnover_constraint: float = DEFAULT_TURNOVER_CONSTRAINT
 
-    # Threshold selection (see scoring.tune_threshold_from_toxicity).
-    # Defaults select the argmax of the aggregate calibration score via the
-    # exact sweep. Block-robust selection (threshold_blocks > 1 with
-    # threshold_robust_lambda > 0) penalizes cross-block score variance.
+    # Robust threshold selection (see scoring.tune_threshold_from_toxicity).
+    # Defaults reproduce the legacy selection (argmax of the aggregate calib
+    # score) via the exact sweep. Block-robust selection (blocks > 1 with
+    # robust_lambda > 0) is available but measurably reduced OOS score on the
+    # BTC pilot (lambda = 0.5 halved the chosen filter rate) - use with care.
     threshold_blocks: int = 1
     threshold_robust_lambda: float = 0.0
     threshold_objective: str = "mean"
     threshold_max_candidates: int = 20_000
 
     # How the tuned filter is applied to the test period:
-    #   "threshold"  - carry the calibration threshold value.
-    #   "rate_daily" - carry the calibration filter rate; the threshold is
-    #                  re-anchored each test day on trailing toxicity (see
-    #                  scoring.make_filter_from_rate_daily).
+    #   "threshold" - carry the calibration threshold value (legacy).
+    #   "rate_daily" - carry the calibration filter *rate*; the threshold is
+    #                  re-anchored each test day on trailing toxicity, which
+    #                  is robust to prediction-distribution drift.
     apply_mode: str = "threshold"
     rate_lookback_days: int = 7
 
@@ -481,11 +488,13 @@ def _ensure_derived_features_if_needed(
     df: pl.DataFrame,
     features: list[str]
 ) -> pl.DataFrame:
-    required_derived = [c for c in DERIVED_FEATURES if c in features]
+    required_derived = [
+        c for c in (DERIVED_FEATURES + EXTENDED_DERIVED_FEATURES) if c in features
+    ]
     missing_derived = [c for c in required_derived if c not in df.columns]
 
     if missing_derived:
-        df = add_derived_features(df)
+        df = add_all_derived_features(df)
 
     return df
 

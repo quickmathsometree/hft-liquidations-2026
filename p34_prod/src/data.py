@@ -15,9 +15,13 @@ import pyarrow.parquet as pq
 from dataclasses import dataclass
 
 from features import (
+    MOMENTUM_WINDOWS_S,
+    ROLLING_WINDOWS_S,
     add_bbo_and_markout,
+    add_liquidation_features,
+    add_mid_momentum_features,
     add_rolling_features,
-    add_liquidation_features
+    get_momentum_column_names,
 )
 
 
@@ -31,7 +35,7 @@ US_PER_DAY = 86_400 * US_PER_SEC
 class DataConfig:
     chunk_days: int = 1
 
-    windows_s: tuple[int, ...] = (5, 30, 120)
+    windows_s: tuple[int, ...] = ROLLING_WINDOWS_S
     horizons_s: tuple[int, ...] = (30, 120, 300)
 
     rebate_bps: float = 0.5
@@ -74,8 +78,9 @@ class DataConfig:
         )
 
         pnl_cols = tuple(f"pnl_{tau}s" for tau in self.horizons_s)
+        momentum_cols = get_momentum_column_names()
 
-        return base_cols + vpin_cols + rv_cols + liq_cols + pnl_cols
+        return base_cols + vpin_cols + rv_cols + liq_cols + momentum_cols + pnl_cols
 
 
 # parquet support functions.
@@ -591,7 +596,14 @@ def compute_chunk(
         windows_s   = list(config.windows_s)
     )
 
-    # 8. Drop left overlap.
+    # 8. Mid-price momentum from the BBO path.
+    df = add_mid_momentum_features(
+        df          = df,
+        bbo         = bbo,
+        windows_s   = list(MOMENTUM_WINDOWS_S),
+    )
+
+    # 9. Drop left overlap.
     df = df.filter(
         (pl.col("timestamp") >= chunk_start_us) & (pl.col("timestamp") < chunk_end_us)
     )
@@ -602,7 +614,7 @@ def compute_chunk(
             f"[{chunk_start_us}, {chunk_end_us})."
         )
 
-    # 9. Fixed output schema/order.
+    # 10. Fixed output schema/order.
     df = (
         df
         .select(list(config.output_columns))

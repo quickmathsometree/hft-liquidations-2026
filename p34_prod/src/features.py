@@ -25,6 +25,15 @@ import polars as pl
 # constants.
 US_PER_SEC = 1_000_000
 
+# Rolling / momentum windows used at dataset build time.
+# v2 build: fast windows (1s, 10s) for tau=30 targets, slow (600s) for tau=300.
+ROLLING_WINDOWS_S = (1, 5, 10, 30, 120, 300, 600)
+MOMENTUM_WINDOWS_S = (5, 10, 30, 120, 300, 600)
+
+# Momentum windows of the v1 build; keeps the "extended" feature set (pilot 6)
+# byte-identical after the v2 rebuild.
+LEGACY_MOMENTUM_WINDOWS_S = (30, 120, 300)
+
 
 # base model features / sets.
 
@@ -66,6 +75,63 @@ LIQUIDATION_FEATURES = [
     "liq_bybit_5s",
     "liq_bybit_30s",
     "liq_bybit_120s",
+]
+
+# 300s rolling columns (dataset rebuild required).
+VPIN_300S_FEATURES = ["vpin_300s"]
+RV_300S_FEATURES = ["rv_300s"]
+LIQUIDATION_300S_FEATURES = [
+    "liq_binance_300s",
+    "liq_bybit_300s",
+]
+
+# Mid-price momentum (bps) over backward-looking BBO windows.
+# NOTE: pinned to the legacy windows so "extended" stays the pilot-6 set.
+MOMENTUM_FEATURES = [
+    f"{prefix}_{w}s"
+    for w in LEGACY_MOMENTUM_WINDOWS_S
+    for prefix in ("mid_ret", "signed_mid_ret", "abs_mid_ret")
+]
+
+# Horizon-matched blocks (v2 dataset build required).
+# Fast block - for tau=30 targets: sub-30s microstructure.
+FAST_ROLLING_FEATURES = [
+    "vpin_1s", "vpin_10s",
+    "rv_1s", "rv_10s",
+    "liq_binance_1s", "liq_binance_10s",
+    "liq_bybit_1s", "liq_bybit_10s",
+]
+FAST_MOMENTUM_FEATURES = [
+    f"{prefix}_{w}s"
+    for w in (5, 10, 30)
+    for prefix in ("mid_ret", "signed_mid_ret", "abs_mid_ret")
+]
+FAST_DERIVED_FEATURES = [
+    "signed_liq_binance_1s",
+    "signed_liq_binance_10s",
+    "signed_liq_bybit_1s",
+    "signed_liq_bybit_10s",
+    "liq_accel_1_30",
+    "vpin_ratio_1_30",
+    "rv_ratio_1_30",
+]
+
+# Slow block - for tau=300 targets: 600s context on top of the 300s block.
+SLOW_ROLLING_FEATURES = [
+    "vpin_600s", "rv_600s",
+    "liq_binance_600s", "liq_bybit_600s",
+]
+SLOW_MOMENTUM_FEATURES = [
+    f"{prefix}_{w}s"
+    for w in (120, 300, 600)
+    for prefix in ("mid_ret", "signed_mid_ret", "abs_mid_ret")
+]
+SLOW_DERIVED_FEATURES = [
+    "signed_liq_binance_600s",
+    "signed_liq_bybit_600s",
+    "net_liq_600s",
+    "vpin_ratio_120_600",
+    "rv_ratio_120_600",
 ]
 
 # Base features WITHOUT raw sign.
@@ -119,6 +185,20 @@ EXTRA_LIQUIDATION_FEATURES = [
     "liq_accel_5_30",
 ]
 
+# Extra derived features that need the 300s rolling columns.
+EXTENDED_DERIVED_FEATURES = [
+    "net_liq_300s",
+    "signed_liq_binance_300s",
+    "signed_liq_bybit_300s",
+    "liq_aligned_300s",
+    "liq_direction_agreement_300s",
+    "liq_accel_30_300",
+    "vpin_ratio_30_300",
+    "rv_ratio_30_300",
+    "liq_binance_ratio_30_300",
+    "liq_bybit_ratio_30_300",
+]
+
 NEW_ENGINEERED_FEATURES = (
     SIGN_INVARIANT_FEATURES
     + RELATIVE_FEATURES
@@ -136,6 +216,46 @@ DERIVED_FEATURES = (
 ADVANCED_FEATURES = (
     BASE_FEATURES
     + DERIVED_FEATURES
+)
+
+EXTENDED_BASE_FEATURES = (
+    BASE_FEATURES
+    + VPIN_300S_FEATURES
+    + RV_300S_FEATURES
+    + LIQUIDATION_300S_FEATURES
+    + MOMENTUM_FEATURES
+)
+
+EXTENDED_FEATURES = (
+    EXTENDED_BASE_FEATURES
+    + DERIVED_FEATURES
+    + EXTENDED_DERIVED_FEATURES
+)
+
+# Horizon-matched sets (pilot 7). All are ADVANCED plus one focused block,
+# so a win over "advanced" at the same tau attributes cleanly to that block.
+FAST30_FEATURES = (
+    ADVANCED_FEATURES
+    + FAST_ROLLING_FEATURES
+    + FAST_MOMENTUM_FEATURES
+    + FAST_DERIVED_FEATURES
+)
+
+ADV_MOMENTUM_FEATURES = ADVANCED_FEATURES + MOMENTUM_FEATURES
+
+ROLL300_FEATURES = (
+    ADVANCED_FEATURES
+    + VPIN_300S_FEATURES
+    + RV_300S_FEATURES
+    + LIQUIDATION_300S_FEATURES
+    + EXTENDED_DERIVED_FEATURES
+)
+
+SLOW300_FEATURES = (
+    ROLL300_FEATURES
+    + SLOW_ROLLING_FEATURES
+    + SLOW_MOMENTUM_FEATURES
+    + SLOW_DERIVED_FEATURES
 )
 
 FEATURE_SETS = {
@@ -156,6 +276,13 @@ FEATURE_SETS = {
     # New advanced feature sets.
     "base_plus_engineered": ADVANCED_FEATURES,
     "advanced": ADVANCED_FEATURES,
+    "extended": EXTENDED_FEATURES,
+
+    # Horizon-matched sets (v2 dataset build required).
+    "fast30": FAST30_FEATURES,
+    "adv_momentum": ADV_MOMENTUM_FEATURES,
+    "roll300": ROLL300_FEATURES,
+    "slow300": SLOW300_FEATURES,
 }
 
 
@@ -589,6 +716,72 @@ def add_liquidation_features(
     return df.with_columns(new_cols)
 
 
+def get_momentum_column_names(
+    windows_s: list[int] | tuple[int, ...] = MOMENTUM_WINDOWS_S,
+) -> tuple[str, ...]:
+    return tuple(
+        f"{prefix}_{w}s"
+        for w in windows_s
+        for prefix in ("mid_ret", "signed_mid_ret", "abs_mid_ret")
+    )
+
+
+def add_mid_momentum_features(
+    df: pl.DataFrame,
+    bbo: pl.DataFrame,
+    windows_s: list[int] | tuple[int, ...] = MOMENTUM_WINDOWS_S,
+) -> pl.DataFrame:
+    """
+    Add backward-looking mid-price return features from the BBO path.
+
+    For every window W adds:
+        mid_ret_{W}s         = (mid_now / mid_{t-W} - 1) * 1e4 bps
+        signed_mid_ret_{W}s  = sign * mid_ret_{W}s
+        abs_mid_ret_{W}s     = abs(mid_ret_{W}s)
+    """
+    validate_columns(
+        df,
+        ["timestamp", "sign", "mid_price"],
+        context="add_mid_momentum_features/df",
+    )
+    validate_columns(
+        bbo,
+        ["timestamp", "mid_price"],
+        context="add_mid_momentum_features/bbo",
+    )
+
+    if df.height == 0 or bbo.height == 0:
+        return df
+
+    bbo_ts = bbo["timestamp"].to_numpy().astype(np.int64, copy=False)
+    bbo_mid = bbo["mid_price"].to_numpy().astype(np.float64, copy=False)
+    trade_ts = df["timestamp"].to_numpy().astype(np.int64, copy=False)
+    mid_now = df["mid_price"].to_numpy().astype(np.float64, copy=False)
+    sign = df["sign"].to_numpy().astype(np.float64, copy=False)
+
+    n_bb = len(bbo_ts)
+    new_cols: list[pl.Series] = []
+
+    for w in windows_s:
+        past_idx = np.searchsorted(bbo_ts, trade_ts - w * US_PER_SEC, side="left") - 1
+        valid = past_idx >= 0
+        mid_past = np.full(len(trade_ts), np.nan, dtype=np.float64)
+        mid_past[valid] = bbo_mid[np.clip(past_idx[valid], 0, n_bb - 1)]
+
+        ret = np.full(len(trade_ts), np.nan, dtype=np.float32)
+        ok = valid & np.isfinite(mid_now) & np.isfinite(mid_past) & (mid_past > 0)
+        ret[ok] = ((mid_now[ok] / mid_past[ok] - 1.0) * 1e4).astype(np.float32)
+
+        signed = np.full(len(trade_ts), np.nan, dtype=np.float32)
+        signed[ok] = (sign[ok] * ret[ok]).astype(np.float32)
+
+        new_cols.append(pl.Series(f"mid_ret_{w}s", ret))
+        new_cols.append(pl.Series(f"signed_mid_ret_{w}s", signed))
+        new_cols.append(pl.Series(f"abs_mid_ret_{w}s", np.abs(ret).astype(np.float32)))
+
+    return df.with_columns(new_cols)
+
+
 # derived features after enriched dataset is built.
 def _add_notional_rolling_median_120s(df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -863,6 +1056,162 @@ def add_derived_features(df: pl.DataFrame) -> pl.DataFrame:
     ])
 
     return df.drop("_notional_median_120s")
+
+
+def _has_columns(df: pl.DataFrame, columns: list[str]) -> bool:
+    return all(c in df.columns for c in columns)
+
+
+def add_extended_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add derived features that require 300s rolling columns.
+    No-op if the base 300s columns are absent (old parquet).
+    """
+    required = [
+        "vpin_300s", "rv_300s",
+        "liq_binance_300s", "liq_bybit_300s",
+        "liq_binance_30s", "liq_bybit_30s",
+        "vpin_30s", "rv_30s",
+    ]
+    if not _has_columns(df, required):
+        return df
+
+    eps = 1e-6
+    return df.with_columns([
+        (
+            pl.col("liq_binance_300s") + pl.col("liq_bybit_300s")
+        ).cast(pl.Float32).alias("net_liq_300s"),
+
+        (pl.col("sign") * pl.col("liq_binance_300s"))
+        .cast(pl.Float32).alias("signed_liq_binance_300s"),
+
+        (pl.col("sign") * pl.col("liq_bybit_300s"))
+        .cast(pl.Float32).alias("signed_liq_bybit_300s"),
+
+        (
+            pl.col("sign") * (
+                pl.col("liq_binance_300s") + pl.col("liq_bybit_300s")
+            )
+        ).cast(pl.Float32).alias("liq_aligned_300s"),
+
+        pl.when(
+            (
+                pl.col("liq_binance_300s").sign()
+                * pl.col("liq_bybit_300s").sign()
+            ) > 0
+        ).then(1.0).otherwise(0.0)
+        .cast(pl.Float32).alias("liq_direction_agreement_300s"),
+
+        (
+            pl.col("liq_binance_30s").abs()
+            / (pl.col("liq_binance_300s").abs() + eps)
+        ).cast(pl.Float32).alias("liq_accel_30_300"),
+
+        (
+            pl.col("vpin_30s") / (pl.col("vpin_300s") + eps)
+        ).cast(pl.Float32).alias("vpin_ratio_30_300"),
+
+        (
+            pl.col("rv_30s") / (pl.col("rv_300s") + eps)
+        ).cast(pl.Float32).alias("rv_ratio_30_300"),
+
+        (
+            pl.col("liq_binance_30s").abs()
+            / (pl.col("liq_binance_300s").abs() + eps)
+        ).cast(pl.Float32).alias("liq_binance_ratio_30_300"),
+
+        (
+            pl.col("liq_bybit_30s").abs()
+            / (pl.col("liq_bybit_300s").abs() + eps)
+        ).cast(pl.Float32).alias("liq_bybit_ratio_30_300"),
+    ])
+
+
+def add_fast_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add derived features that require the fast (1s/10s) rolling columns.
+    No-op if the fast columns are absent (v1 parquet).
+    """
+    required = [
+        "vpin_1s", "rv_1s",
+        "liq_binance_1s", "liq_bybit_1s",
+        "liq_binance_10s", "liq_bybit_10s",
+        "liq_binance_30s",
+        "vpin_30s", "rv_30s",
+    ]
+    if not _has_columns(df, required):
+        return df
+
+    eps = 1e-6
+    return df.with_columns([
+        (pl.col("sign") * pl.col("liq_binance_1s"))
+        .cast(pl.Float32).alias("signed_liq_binance_1s"),
+
+        (pl.col("sign") * pl.col("liq_binance_10s"))
+        .cast(pl.Float32).alias("signed_liq_binance_10s"),
+
+        (pl.col("sign") * pl.col("liq_bybit_1s"))
+        .cast(pl.Float32).alias("signed_liq_bybit_1s"),
+
+        (pl.col("sign") * pl.col("liq_bybit_10s"))
+        .cast(pl.Float32).alias("signed_liq_bybit_10s"),
+
+        (
+            pl.col("liq_binance_1s").abs()
+            / (pl.col("liq_binance_30s").abs() + eps)
+        ).cast(pl.Float32).alias("liq_accel_1_30"),
+
+        (
+            pl.col("vpin_1s") / (pl.col("vpin_30s") + eps)
+        ).cast(pl.Float32).alias("vpin_ratio_1_30"),
+
+        (
+            pl.col("rv_1s") / (pl.col("rv_30s") + eps)
+        ).cast(pl.Float32).alias("rv_ratio_1_30"),
+    ])
+
+
+def add_slow_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add derived features that require the slow (600s) rolling columns.
+    No-op if the slow columns are absent (v1 parquet).
+    """
+    required = [
+        "vpin_600s", "rv_600s",
+        "liq_binance_600s", "liq_bybit_600s",
+        "vpin_120s", "rv_120s",
+    ]
+    if not _has_columns(df, required):
+        return df
+
+    eps = 1e-6
+    return df.with_columns([
+        (pl.col("sign") * pl.col("liq_binance_600s"))
+        .cast(pl.Float32).alias("signed_liq_binance_600s"),
+
+        (pl.col("sign") * pl.col("liq_bybit_600s"))
+        .cast(pl.Float32).alias("signed_liq_bybit_600s"),
+
+        (
+            pl.col("liq_binance_600s") + pl.col("liq_bybit_600s")
+        ).cast(pl.Float32).alias("net_liq_600s"),
+
+        (
+            pl.col("vpin_120s") / (pl.col("vpin_600s") + eps)
+        ).cast(pl.Float32).alias("vpin_ratio_120_600"),
+
+        (
+            pl.col("rv_120s") / (pl.col("rv_600s") + eps)
+        ).cast(pl.Float32).alias("rv_ratio_120_600"),
+    ])
+
+
+def add_all_derived_features(df: pl.DataFrame) -> pl.DataFrame:
+    """Base derived features + optional 300s / fast / slow extensions."""
+    df = add_extended_derived_features(add_derived_features(df))
+    df = add_fast_derived_features(df)
+    df = add_slow_derived_features(df)
+    return df
 
 # model matrix extraction.
 def drop_invalid_rows_for_target(
