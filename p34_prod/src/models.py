@@ -248,6 +248,8 @@ def make_lgbm_train_fn(
             colsample_bytree    = colsample_bytree,
             random_state        = 42,
             n_jobs              = -1,
+            deterministic       = True,   # bit-reproducible across runs
+            force_row_wise      = True,   # required with deterministic + multithread
             verbose             = verbose
         )
 
@@ -309,6 +311,8 @@ def make_lgbm_huber_train_fn(
             colsample_bytree    = colsample_bytree,
             random_state        = 42,
             n_jobs              = -1,
+            deterministic       = True,   # bit-reproducible across runs
+            force_row_wise      = True,   # required with deterministic + multithread
             verbose             = verbose
         )
 
@@ -482,6 +486,8 @@ def make_lgbm_huber_ensemble_train_fn(
                 colsample_bytree    = cfg.get("colsample_bytree", 0.8),
                 random_state        = cfg.get("random_state", base_random_state + k),
                 n_jobs              = -1,
+                deterministic       = True,   # bit-reproducible across runs
+                force_row_wise      = True,   # required with deterministic + multithread
                 verbose             = verbose,
             )
 
